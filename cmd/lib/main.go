@@ -57,7 +57,7 @@ func startProxy(port uint16, cfg *liteclient.GlobalConfig) string {
 	var err error
 	go func() {
 		if cfg != nil {
-			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), nil, nil, false, "LIB "+GitCommit, cfg, nil, nil)
+			err = proxy.RunProxyWithConfig(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), nil, ch, false, "LIB "+GitCommit, cfg, nil, nil)
 		} else {
 			err = proxy.RunProxy(ActiveProxy, "127.0.0.1:"+fmt.Sprint(port), nil, ch, "LIB "+GitCommit, false, "", nil, nil)
 		}
