@@ -75,6 +75,24 @@ type proxy struct {
 
 var client *http.Client
 
+func isHostInSpecialZone(host string) bool {
+	var specialZones = map[string]struct{}{
+		".ton":  {}, // Keep it for now.
+		".adnl": {},
+		".bag":  {},
+		".ion":  {},
+	}
+
+	idx := strings.LastIndex(host, ".")
+	if idx == -1 {
+		return false
+	}
+
+	zone := strings.ToLower(host[idx:])
+	_, ok := specialZones[zone]
+	return ok
+}
+
 func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	if req.URL.Scheme == "" {
 		// if no scheme - we check forwarded proto
@@ -108,8 +126,7 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	req.Header.Set("X-Tonutils-Proxy", p.version)
 
 	var c = http.DefaultClient
-	if strings.HasSuffix(req.Host, ".ton") || strings.HasSuffix(req.Host, ".adnl") ||
-		strings.HasSuffix(req.Host, ".t.me") || strings.HasSuffix(req.Host, ".bag") {
+	if isHostInSpecialZone(req.Host) {
 		log.Debug().Str("method", req.Method).Str("url", req.URL.String()).Msg("over rldp")
 		// proxy requests to ton using special client
 		c = client
