@@ -3,13 +3,15 @@ package main
 import (
 	"context"
 	"flag"
+	"os"
+	"os/signal"
+	"strings"
+
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-proxy/cmd/proxy-cli/config"
 	"github.com/xssnick/tonutils-proxy/proxy"
-	"os"
-	"os/signal"
 )
 
 var GitCommit = "dev"
@@ -40,7 +42,11 @@ func main() {
 
 	var customTinNetCfg *liteclient.GlobalConfig
 	if cfg.CustomTunnelNetworkConfigPath != "" {
-		customTinNetCfg, err = liteclient.GetConfigFromFile(cfg.CustomTunnelNetworkConfigPath)
+		if strings.HasPrefix(cfg.CustomTunnelNetworkConfigPath, "http://") || strings.HasPrefix(cfg.CustomTunnelNetworkConfigPath, "https://") {
+			customTinNetCfg, err = liteclient.GetConfigFromUrl(context.Background(), cfg.CustomTunnelNetworkConfigPath)
+		} else {
+			customTinNetCfg, err = liteclient.GetConfigFromFile(cfg.CustomTunnelNetworkConfigPath)
+		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to load custom net config for tun")
 		}

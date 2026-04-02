@@ -7,6 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
+	"time"
+
 	"github.com/rs/zerolog/log"
 	tunnelConfig "github.com/ton-blockchain/adnl-tunnel/config"
 	"github.com/ton-blockchain/adnl-tunnel/tunnel"
@@ -21,13 +29,6 @@ import (
 	"github.com/xssnick/tonutils-proxy/proxy/transport"
 	"github.com/xssnick/tonutils-storage/config"
 	"github.com/xssnick/tonutils-storage/storage"
-	"io"
-	"net"
-	"net/http"
-	"os"
-	"runtime"
-	"strings"
-	"time"
 )
 
 // Hop-by-hop headers. These are removed when sent to the backend.
@@ -150,6 +151,8 @@ type State struct {
 }
 
 func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
+	const configDefaultURL = `https://cdn.ice.io/mainnet/global.config.json`
+
 	if res != nil {
 		res <- State{
 			Type:  "loading",
@@ -160,14 +163,19 @@ func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey
 	var err error
 	var lsCfg *liteclient.GlobalConfig
 	if netConfigPath != "" {
-		log.Info().Msg("Fetching TON network config from disk...")
-		lsCfg, err = liteclient.GetConfigFromFile(netConfigPath)
+		if strings.HasPrefix(netConfigPath, "http://") || strings.HasPrefix(netConfigPath, "https://") {
+			log.Info().Str("url", netConfigPath).Msg("Fetching TON network config from url...")
+			lsCfg, err = liteclient.GetConfigFromUrl(context.Background(), netConfigPath)
+		} else {
+			log.Info().Str("file", netConfigPath).Msg("Fetching TON network config from disk...")
+			lsCfg, err = liteclient.GetConfigFromFile(netConfigPath)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to parse ton config: %w", err)
 		}
 	} else {
-		log.Info().Msg("Fetching TON network config...")
-		lsCfg, err = liteclient.GetConfigFromUrl(context.Background(), "https://ton-blockchain.github.io/global.config.json")
+		log.Info().Str("url", configDefaultURL).Msg("Fetching TON network config...")
+		lsCfg, err = liteclient.GetConfigFromUrl(context.Background(), configDefaultURL)
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to download ton config; taking it from static cache")
 			lsCfg = &liteclient.GlobalConfig{}
@@ -489,11 +497,15 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 	api := ton.NewAPIClient(pool)
 
 	var root *address.Address
-	for i := 0; i < 5; i++ { // retry to not get liteserver not found block err
+	for attempt := range 5 { // retry to not get liteserver not found block err
 		// get root dns address from network config
-		root, err = dns.GetRootContractAddr(context.Background(), api)
+		log.Debug().Int("attempt", attempt+1).Msg("fetching root dns address from network config")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		root, err = dns.GetRootContractAddr(ctx, api)
+		cancel()
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
+			log.Error().Err(err).Msg("failed to get root dns address, retrying...")
 			continue
 		}
 		break
