@@ -24,8 +24,8 @@ define build_apple_variant
 		-buildmode=c-archive -trimpath -gcflags=all="-l" \
 		-ldflags="-w -s -X main.GitCommit=$(ver)" \
 		-o "$(call apple_lib_path,$(6))" cmd/lib/main.go
-	
-	@mkdir -p $(call apple_headers_path,$(6)) 
+
+	@mkdir -p $(call apple_headers_path,$(6))
 	@mv -f build/lib/apple/$(6)/tonutils-proxy.h $(call apple_headers_path,$(6))/tonutils-proxy.h
 endef
 
@@ -33,6 +33,15 @@ define fat_apple_variants
 	@mkdir -p $(dir $(1))
 	xcrun lipo -create $(2) -output $(1)
 endef
+
+.PHONY: test
+test:
+	go tool gotestsum -f github-actions --rerun-fails=3 --packages="./..." --rerun-fails-run-root-test -- -timeout 20m -tags test -cover -covermode atomic
+
+.PHONY: up
+up:
+	go get -v -u ./...
+	go mod tidy
 
 build-apple-xcframework:
 	# ios
@@ -83,4 +92,3 @@ ndk_cc:=$(ndk)/toolchains/llvm/prebuilt/$(ndk_arch)/bin/aarch64-linux-android$(n
 
 build-android-lib:
 	CC=$(ndk_cc) CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build -buildmode c-shared -trimpath -gcflags=all="-l" -ldflags="-w -s -X main.GitCommit=$(ver)" -o build/lib/android/tonutils-proxy.so cmd/lib/main.go
-

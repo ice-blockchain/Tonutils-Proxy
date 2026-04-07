@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-proxy/proxy"
-	"log"
 )
 
 var GitCommit string
