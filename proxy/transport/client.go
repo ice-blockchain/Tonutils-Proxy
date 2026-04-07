@@ -730,6 +730,15 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 						return
 					}
 					log.Error().Err(err).Str("domain", host).Msg("resolve error")
+
+					var netErr net.Error
+					if !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &netErr) {
+						select {
+						case <-lookupCtx.Done():
+							return
+						case <-time.After(200 * time.Millisecond):
+						}
+					}
 					continue
 				}
 				select {
