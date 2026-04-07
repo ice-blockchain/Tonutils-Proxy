@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -680,8 +681,8 @@ func (t *Transport) fillDHTAddress(ctx context.Context, result *ResolveResult) {
 }
 
 func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveResult, error) {
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		host = host[:idx]
+	if targetHost, _, err := net.SplitHostPort(host); targetHost != "" && err == nil {
+		host = targetHost
 	}
 
 	result := &ResolveResult{Domain: host}
@@ -728,8 +729,10 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 					log.Error().Err(err).Str("domain", host).Msg("resolve error")
 					continue
 				}
-				ch <- domain
-				return
+				select {
+				case <-ctx.Done():
+				case ch <- domain:
+				}
 			}
 		}(i)
 	}
