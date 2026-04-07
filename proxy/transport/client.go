@@ -7,13 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/rs/zerolog/log"
-	"github.com/xssnick/tonutils-go/adnl"
-	"github.com/xssnick/tonutils-go/adnl/address"
-	"github.com/xssnick/tonutils-go/adnl/rldp"
-	"github.com/xssnick/tonutils-go/tl"
-	"github.com/xssnick/tonutils-go/ton/dns"
-	"github.com/xssnick/tonutils-storage/storage"
 	"io"
 	"net/http"
 	"reflect"
@@ -22,6 +15,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/rs/zerolog/log"
+	"github.com/xssnick/tonutils-go/adnl"
+	"github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/rldp"
+	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/ton/dns"
+	"github.com/xssnick/tonutils-storage/storage"
 )
 
 const _ChunkSize = 1 << 17
@@ -359,10 +360,8 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 
 func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo) (*http.Response, error) {
 	fileName := request.URL.Path
-	if strings.HasPrefix(fileName, "/") {
-		fileName = fileName[1:]
-	}
 
+	strings.TrimPrefix(fileName, "/")
 	if fileName == "" {
 		fileName = "index.html"
 	}
@@ -651,6 +650,112 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	}
 
 	return httpResp, nil
+}
+
+type ResolveResult struct {
+	Domain   string `json:"domain"`
+	Type     string `json:"type"`
+	ADNLAddr string `json:"adnl_address,omitempty"`
+	BagID    string `json:"bag_id,omitempty"`
+	IP       string `json:"ip,omitempty"`
+	Port     int    `json:"port,omitempty"`
+}
+
+func (t *Transport) fillDHTAddress(ctx context.Context, result *ResolveResult) {
+	id, err := hex.DecodeString(result.ADNLAddr)
+	if err != nil {
+		return
+	}
+
+	addresses, _, err := t.dht.FindAddresses(ctx, id)
+	if err != nil {
+		log.Debug().Err(err).Str("adnl", result.ADNLAddr).Msg("DHT lookup failed")
+		return
+	}
+
+	if len(addresses.Addresses) > 0 {
+		result.IP = addresses.Addresses[0].IP.String()
+		result.Port = int(addresses.Addresses[0].Port)
+	}
+}
+
+func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveResult, error) {
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	result := &ResolveResult{Domain: host}
+
+	if strings.HasSuffix(host, ".adnl") {
+		id, err := ParseADNLAddress(host[:len(host)-5])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse adnl address %s: %w", host, err)
+		}
+		result.Type = "adnl"
+		result.ADNLAddr = hex.EncodeToString(id)
+		t.fillDHTAddress(ctx, result)
+		return result, nil
+	}
+
+	if strings.HasSuffix(host, ".bag") {
+		id, err := hex.DecodeString(host[:len(host)-4])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse bag id %s: %w", host, err)
+		}
+		result.Type = "storage"
+		result.BagID = hex.EncodeToString(id)
+		return result, nil
+	}
+
+	lookupCtx, stopLookup := context.WithCancel(ctx)
+	defer stopLookup()
+
+	ch := make(chan *dns.Domain, 3)
+	for i := 0; i < 3; i++ {
+		go func(i int) {
+			for {
+				resolveCtx, cancel := context.WithTimeout(lookupCtx, time.Duration((i+1)*2)*time.Second)
+				domain, err := t.resolver.Resolve(resolveCtx, host)
+				cancel()
+				if err != nil {
+					if lookupCtx.Err() != nil {
+						return
+					}
+					if errors.Is(err, dns.ErrNoSuchRecord) {
+						ch <- nil
+						return
+					}
+					log.Error().Err(err).Str("domain", host).Msg("resolve error")
+					continue
+				}
+				ch <- domain
+				return
+			}
+		}(i)
+	}
+
+	select {
+	case domain := <-ch:
+		stopLookup()
+		if domain == nil {
+			return nil, fmt.Errorf("domain %s: %w", host, dns.ErrNoSuchRecord)
+		}
+		id, inStorage := domain.GetSiteRecord()
+		if id == nil {
+			return nil, fmt.Errorf("domain %s: no site record found in DNS", host)
+		}
+		if inStorage {
+			result.Type = "storage"
+			result.BagID = hex.EncodeToString(id)
+		} else {
+			result.Type = "adnl"
+			result.ADNLAddr = hex.EncodeToString(id)
+			t.fillDHTAddress(ctx, result)
+		}
+		return result, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("failed to resolve domain %s", host)
+	}
 }
 
 func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error) {

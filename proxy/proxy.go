@@ -71,9 +71,12 @@ func appendHostToXForwardHeader(header http.Header, host string) {
 type proxy struct {
 	version   string
 	blockHttp bool
+	authUser  string
+	authPass  string
 }
 
 var client *http.Client
+var proxyTransport *transport.Transport
 
 func isHostInSpecialZone(host string) bool {
 	var specialZones = map[string]struct{}{
@@ -93,7 +96,65 @@ func isHostInSpecialZone(host string) bool {
 	return ok
 }
 
+func (p *proxy) checkAuth(wr http.ResponseWriter, req *http.Request) bool {
+	if p.authUser == "" && p.authPass == "" {
+		return true
+	}
+	user, pass, ok := req.BasicAuth()
+	if !ok || user != p.authUser || pass != p.authPass {
+		wr.Header().Set("Proxy-Authenticate", `Basic realm="Tonutils Proxy"`)
+		http.Error(wr, "Proxy authentication required", http.StatusProxyAuthRequired)
+		return false
+	}
+	return true
+}
+
+func (p *proxy) handleResolve(wr http.ResponseWriter, req *http.Request) {
+	domain := strings.TrimPrefix(req.URL.Path, "/resolve/")
+	if domain == "" {
+		http.Error(wr, "missing domain name", http.StatusBadRequest)
+		return
+	}
+
+	if proxyTransport == nil {
+		http.Error(wr, "proxy not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
+	defer cancel()
+
+	result, err := proxyTransport.ResolveDomain(ctx, domain)
+	if err != nil {
+		log.Error().Err(err).Str("domain", domain).Msg("resolve failed")
+		if errors.Is(err, dns.ErrNoSuchRecord) || strings.Contains(err.Error(), "no site record") {
+			http.Error(wr, "domain not found: "+err.Error(), http.StatusNotFound)
+		} else {
+			http.Error(wr, "resolve failed: "+err.Error(), http.StatusBadGateway)
+		}
+		return
+	}
+
+	log.Debug().Str("domain", domain).Str("type", result.Type).Str("adnl_address", result.ADNLAddr).Str("bag_id", result.BagID).Str("ip", result.IP).Int("port", result.Port).Msg("resolve success")
+
+	wr.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(wr).Encode(result)
+}
+
 func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
+	// Handle direct requests to the proxy server (no scheme, no URL host)
+	if req.URL.Scheme == "" && req.URL.Host == "" && strings.HasPrefix(req.URL.Path, "/resolve/") {
+		if !p.checkAuth(wr, req) {
+			return
+		}
+		p.handleResolve(wr, req)
+		return
+	}
+
+	if !p.checkAuth(wr, req) {
+		return
+	}
+
 	if req.URL.Scheme == "" {
 		// if no scheme - we check forwarded proto
 		req.URL.Scheme = req.Header.Get("X-Forwarded-Proto")
@@ -166,6 +227,9 @@ type State struct {
 	State   string
 	Stopped bool
 }
+
+var AuthUser string
+var AuthPass string
 
 func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
 	const configDefaultURL = `https://cdn.ice.io/mainnet/global.config.json`
@@ -442,6 +506,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	})
 
 	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
+	proxyTransport = t
 	client = &http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -452,7 +517,12 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 
 	log.Info().Str("address", addr).Msg("Starting proxy server")
 
-	server := http.Server{Addr: addr, Handler: &proxy{blockHttp: blockHttp, version: versionAndDevice}}
+	server := http.Server{Addr: addr, Handler: &proxy{
+		blockHttp: blockHttp,
+		version:   versionAndDevice,
+		authUser:  AuthUser,
+		authPass:  AuthPass,
+	}}
 
 	go func() {
 		<-ctx.Done()
@@ -514,22 +584,29 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 	api := ton.NewAPIClient(pool)
 
 	var root *address.Address
-	for attempt := range 5 { // retry to not get liteserver not found block err
-		// get root dns address from network config
-		log.Debug().Int("attempt", attempt+1).Msg("fetching root dns address from network config")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		root, err = dns.GetRootContractAddr(ctx, api)
-		cancel()
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			log.Error().Err(err).Msg("failed to get root dns address, retrying...")
-			continue
+	if true {
+		// Use it temporarily while we wait for config #4 fix.
+		log.Warn().Msg("Using hardcoded root dns address for ION network")
+		root = address.MustParseAddr("Ef_f_EXeJkjJIKwCPP9kGVrp-R1Pkf1jxowkvvxsB7TFG3uS")
+	} else {
+		for attempt := range 5 { // retry to not get liteserver not found block err
+			// get root dns address from network config
+			log.Debug().Int("attempt", attempt+1).Msg("fetching root dns address from network config")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			root, err = dns.GetRootContractAddr(ctx, api)
+			cancel()
+			if err != nil {
+				time.Sleep(500 * time.Millisecond)
+				log.Error().Err(err).Msg("failed to get root dns address, retrying...")
+				continue
+			}
+			break
 		}
-		break
 	}
 	if err != nil {
 		return nil, nil, err
 	}
 
+	log.Info().Str("root_dns", root.String()).Msg("initialized DNS resolver with root address")
 	return pool, dns.NewDNSClient(api, root), nil
 }
