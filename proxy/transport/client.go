@@ -361,7 +361,7 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo) (*http.Response, error) {
 	fileName := request.URL.Path
 
-	strings.TrimPrefix(fileName, "/")
+	fileName = strings.TrimPrefix(fileName, "/")
 	if fileName == "" {
 		fileName = "index.html"
 	}
