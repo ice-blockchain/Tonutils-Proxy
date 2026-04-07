@@ -21,6 +21,8 @@ func main() {
 	var verbosity = flag.Int("verbosity", 2, "Debug logs")
 	var blockHttp = flag.Bool("no-http", false, "Block ordinary http requests")
 	var networkConfigPath = flag.String("global-config", "", "path to ton network config file")
+	var authUser = flag.String("auth-user", "", "Basic auth username for proxy access (optional)")
+	var authPass = flag.String("auth-pass", "", "Basic auth password for proxy access (optional)")
 
 	flag.Parse()
 
@@ -51,6 +53,9 @@ func main() {
 			log.Fatal().Err(err).Msg("failed to load custom net config for tun")
 		}
 	}
+
+	proxy.AuthUser = *authUser
+	proxy.AuthPass = *authPass
 
 	tunnelEnabled := cfg.TunnelConfig != nil && cfg.TunnelConfig.NodesPoolConfigPath != ""
 	closerCtx, stop := context.WithCancel(context.Background())
