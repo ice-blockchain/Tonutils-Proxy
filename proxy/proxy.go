@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,11 +97,33 @@ func isHostInSpecialZone(host string) bool {
 	return ok
 }
 
+func parseBasicAuth(header string) (user, pass string, ok bool) {
+	const prefix = "Basic "
+	if !strings.HasPrefix(header, prefix) {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(header[len(prefix):])
+	if err != nil {
+		return "", "", false
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
 func (p *proxy) checkAuth(wr http.ResponseWriter, req *http.Request) bool {
 	if p.authUser == "" && p.authPass == "" {
 		return true
 	}
-	user, pass, ok := req.BasicAuth()
+
+	// Try Proxy-Authorization first (proxy requests), then Authorization (direct requests)
+	user, pass, ok := parseBasicAuth(req.Header.Get("Proxy-Authorization"))
+	if !ok {
+		user, pass, ok = req.BasicAuth()
+	}
+
 	if !ok || user != p.authUser || pass != p.authPass {
 		code := http.StatusProxyAuthRequired
 		authHeader := "Proxy-Authenticate"
