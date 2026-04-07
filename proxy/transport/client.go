@@ -723,7 +723,10 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 						return
 					}
 					if errors.Is(err, dns.ErrNoSuchRecord) {
-						ch <- nil
+						select {
+						case <-lookupCtx.Done():
+						case ch <- nil:
+						}
 						return
 					}
 					log.Error().Err(err).Str("domain", host).Msg("resolve error")
