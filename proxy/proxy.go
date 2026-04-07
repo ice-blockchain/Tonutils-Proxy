@@ -103,10 +103,12 @@ func (p *proxy) checkAuth(wr http.ResponseWriter, req *http.Request) bool {
 	user, pass, ok := req.BasicAuth()
 	if !ok || user != p.authUser || pass != p.authPass {
 		code := http.StatusProxyAuthRequired
+		authHeader := "Proxy-Authenticate"
 		if strings.HasPrefix(req.URL.Path, "/resolve/") {
 			code = http.StatusUnauthorized
+			authHeader = "WWW-Authenticate"
 		}
-		wr.Header().Set("Proxy-Authenticate", `Basic realm="Tonutils Proxy"`)
+		wr.Header().Set(authHeader, `Basic realm="Tonutils Proxy"`)
 		http.Error(wr, "Proxy authentication required", code)
 		return false
 	}
