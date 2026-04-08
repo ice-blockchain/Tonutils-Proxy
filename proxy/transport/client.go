@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
@@ -24,6 +26,19 @@ import (
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton/dns"
 	"github.com/xssnick/tonutils-storage/storage"
+)
+
+var (
+	resolveRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "tonproxy_resolve_requests_total",
+		Help: "Total number of domain resolve requests",
+	}, []string{"status"})
+
+	resolveDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "tonproxy_resolve_duration_seconds",
+		Help:    "Duration of domain resolve requests in seconds",
+		Buckets: prometheus.DefBuckets,
+	})
 )
 
 const _ChunkSize = 1 << 17
@@ -680,32 +695,41 @@ func (t *Transport) fillDHTAddress(ctx context.Context, result *ResolveResult) {
 	}
 }
 
-func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveResult, error) {
-	if targetHost, _, err := net.SplitHostPort(host); targetHost != "" && err == nil {
+// resolveHost resolves a hostname to a raw ID and storage flag.
+// Handles .adnl, .bag suffixes and parallel TON DNS lookup.
+func (t *Transport) resolveHost(ctx context.Context, host string) (id []byte, inStorage bool, err error) {
+	if targetHost, _, splitErr := net.SplitHostPort(host); targetHost != "" && splitErr == nil {
 		host = targetHost
 	}
 
-	result := &ResolveResult{Domain: host}
+	start := time.Now()
+	defer func() {
+		resolveDurationSeconds.Observe(time.Since(start).Seconds())
+		if err != nil {
+			if errors.Is(err, dns.ErrNoSuchRecord) || strings.Contains(err.Error(), "no site record") {
+				resolveRequestsTotal.WithLabelValues("not_found").Inc()
+			} else {
+				resolveRequestsTotal.WithLabelValues("error").Inc()
+			}
+		} else {
+			resolveRequestsTotal.WithLabelValues("success").Inc()
+		}
+	}()
 
 	if strings.HasSuffix(host, ".adnl") {
-		id, err := ParseADNLAddress(host[:len(host)-5])
+		id, err = ParseADNLAddress(host[:len(host)-5])
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse adnl address %s: %w", host, err)
+			return nil, false, fmt.Errorf("failed to parse adnl address %s: %w", host, err)
 		}
-		result.Type = "adnl"
-		result.ADNLAddr = hex.EncodeToString(id)
-		t.fillDHTAddress(ctx, result)
-		return result, nil
+		return id, false, nil
 	}
 
 	if strings.HasSuffix(host, ".bag") {
-		id, err := hex.DecodeString(host[:len(host)-4])
+		id, err = hex.DecodeString(host[:len(host)-4])
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse bag id %s: %w", host, err)
+			return nil, false, fmt.Errorf("failed to parse bag id %s: %w", host, err)
 		}
-		result.Type = "storage"
-		result.BagID = hex.EncodeToString(id)
-		return result, nil
+		return id, true, nil
 	}
 
 	lookupCtx, stopLookup := context.WithCancel(ctx)
@@ -715,6 +739,7 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 	for i := 0; i < 3; i++ {
 		go func(i int) {
 			for {
+				// each thread has bigger timeout, to cover users with high ping
 				resolveCtx, cancel := context.WithTimeout(lookupCtx, time.Duration((i+1)*2)*time.Second)
 				domain, err := t.resolver.Resolve(resolveCtx, host)
 				cancel()
@@ -742,7 +767,7 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 					continue
 				}
 				select {
-				case <-ctx.Done():
+				case <-lookupCtx.Done():
 				case ch <- domain:
 				}
 			}
@@ -753,84 +778,47 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 	case domain := <-ch:
 		stopLookup()
 		if domain == nil {
-			return nil, fmt.Errorf("domain %s: %w", host, dns.ErrNoSuchRecord)
+			return nil, false, fmt.Errorf("domain %s: %w", host, dns.ErrNoSuchRecord)
 		}
-		id, inStorage := domain.GetSiteRecord()
+		id, inStorage = domain.GetSiteRecord()
 		if id == nil {
-			return nil, fmt.Errorf("domain %s: no site record found in DNS", host)
+			return nil, false, fmt.Errorf("domain %s: no site record found in DNS", host)
 		}
-		if inStorage {
-			result.Type = "storage"
-			result.BagID = hex.EncodeToString(id)
-		} else {
-			result.Type = "adnl"
-			result.ADNLAddr = hex.EncodeToString(id)
-			t.fillDHTAddress(ctx, result)
-		}
-		return result, nil
+		log.Info().Str("domain", host).Dur("duration", time.Since(start)).Msg("resolve domain took")
+		return id, inStorage, nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("failed to resolve domain %s", host)
+		return nil, false, fmt.Errorf("failed to resolve domain %s", host)
 	}
 }
 
-func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error) {
-	var id []byte
-	var inStorage bool
-	if strings.HasSuffix(host, ".adnl") {
-		id, err = ParseADNLAddress(host[:len(host)-5])
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse adnl address %s, err: %w", host, err)
-		}
-	} else if strings.HasSuffix(host, ".bag") {
-		id, err = hex.DecodeString(host[:len(host)-4])
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse bag id %s, err: %w", host, err)
-		}
-		inStorage = true
+// ResolveDomain resolves a domain and returns structured metadata (for the API).
+func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveResult, error) {
+	if targetHost, _, err := net.SplitHostPort(host); targetHost != "" && err == nil {
+		host = targetHost
+	}
+
+	id, inStorage, err := t.resolveHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &ResolveResult{Domain: host}
+	if inStorage {
+		result.Type = "storage"
+		result.BagID = hex.EncodeToString(id)
 	} else {
-		tm := time.Now()
-		lookupCtx, stopLookup := context.WithCancel(ctx)
-		ch := make(chan *dns.Domain, 3)
-		for i := 0; i < 3; i++ { // do parallel lookup on diff nodes to speedup
-			go func(i int) {
-				for {
-					// each new thread has bigger timeout, to cover users with high ping
-					resolveCtx, cancel := context.WithTimeout(lookupCtx, time.Duration((i+1)*2)*time.Second)
-					domain, err := t.resolver.Resolve(resolveCtx, host)
-					cancel()
-					if err != nil {
-						if lookupCtx.Err() != nil {
-							return
-						}
+		result.Type = "adnl"
+		result.ADNLAddr = hex.EncodeToString(id)
+		t.fillDHTAddress(ctx, result)
+	}
+	return result, nil
+}
 
-						if errors.Is(err, dns.ErrNoSuchRecord) {
-							ch <- nil
-							return
-						}
-						log.Error().Err(err).Str("domain", host).Msg("resolve error")
-						continue
-					}
-
-					ch <- domain
-					return
-				}
-			}(i)
-		}
-
-		var domain *dns.Domain
-		select {
-		case domain = <-ch:
-			stopLookup()
-			if domain == nil {
-				return nil, fmt.Errorf("domain %s resolve err: %w", host, dns.ErrNoSuchRecord)
-			}
-		case <-lookupCtx.Done():
-			stopLookup()
-			return nil, fmt.Errorf("failed to resolve domain %s in ton dns", host)
-		}
-		log.Info().Str("domain", host).Dur("duration", time.Since(tm)).Msg("resolve domain took")
-
-		id, inStorage = domain.GetSiteRecord()
+// resolve resolves a domain and establishes a connection (for the proxy).
+func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error) {
+	id, inStorage, err := t.resolveHost(ctx, host)
+	if err != nil {
+		return nil, err
 	}
 
 	if inStorage {
