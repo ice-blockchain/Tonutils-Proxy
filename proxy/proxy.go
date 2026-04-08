@@ -13,9 +13,13 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
 	tunnelConfig "github.com/ton-blockchain/adnl-tunnel/config"
 	"github.com/ton-blockchain/adnl-tunnel/tunnel"
@@ -76,8 +80,22 @@ type proxy struct {
 	authPass  string
 }
 
-var client *http.Client
-var proxyTransport *transport.Transport
+var client atomic.Pointer[http.Client]
+var proxyTransport atomic.Pointer[transport.Transport]
+
+var (
+	proxyRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "tonproxy_proxy_requests_total",
+		Help: "Total number of proxied requests",
+	}, []string{"method", "status_code", "network"})
+
+	proxyRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "tonproxy_proxy_request_duration_seconds",
+		Help:    "Duration of proxied requests in seconds",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method", "network"})
+)
+
 
 func isHostInSpecialZone(host string) bool {
 	var specialZones = map[string]struct{}{
@@ -118,67 +136,21 @@ func (p *proxy) checkAuth(wr http.ResponseWriter, req *http.Request) bool {
 		return true
 	}
 
-	// Try Proxy-Authorization first (proxy requests), then Authorization (direct requests)
 	user, pass, ok := parseBasicAuth(req.Header.Get("Proxy-Authorization"))
 	if !ok {
 		user, pass, ok = req.BasicAuth()
 	}
 
 	if !ok || user != p.authUser || pass != p.authPass {
-		code := http.StatusProxyAuthRequired
-		authHeader := "Proxy-Authenticate"
-		if strings.HasPrefix(req.URL.Path, "/resolve/") {
-			code = http.StatusUnauthorized
-			authHeader = "WWW-Authenticate"
-		}
-		wr.Header().Set(authHeader, `Basic realm="Tonutils Proxy"`)
-		http.Error(wr, "Proxy authentication required", code)
+		wr.Header().Set("Proxy-Authenticate", `Basic realm="Tonutils Proxy"`)
+		http.Error(wr, "Proxy authentication required", http.StatusProxyAuthRequired)
 		return false
 	}
 	return true
 }
 
-func (p *proxy) handleResolve(wr http.ResponseWriter, req *http.Request) {
-	domain := strings.TrimPrefix(req.URL.Path, "/resolve/")
-	if domain == "" {
-		http.Error(wr, "missing domain name", http.StatusBadRequest)
-		return
-	}
-
-	if proxyTransport == nil {
-		http.Error(wr, "proxy not ready", http.StatusServiceUnavailable)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
-	defer cancel()
-
-	result, err := proxyTransport.ResolveDomain(ctx, domain)
-	if err != nil {
-		log.Error().Err(err).Str("domain", domain).Msg("resolve failed")
-		if errors.Is(err, dns.ErrNoSuchRecord) || strings.Contains(err.Error(), "no site record") {
-			http.Error(wr, "domain not found: "+err.Error(), http.StatusNotFound)
-		} else {
-			http.Error(wr, "resolve failed: "+err.Error(), http.StatusBadGateway)
-		}
-		return
-	}
-
-	log.Debug().Str("domain", domain).Str("type", result.Type).Str("adnl_address", result.ADNLAddr).Str("bag_id", result.BagID).Str("ip", result.IP).Int("port", result.Port).Msg("resolve success")
-
-	wr.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(wr).Encode(result)
-}
-
 func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
-	// Handle direct requests to the proxy server (no scheme, no URL host)
-	if req.URL.Scheme == "" && req.URL.Host == "" && strings.HasPrefix(req.URL.Path, "/resolve/") {
-		if !p.checkAuth(wr, req) {
-			return
-		}
-		p.handleResolve(wr, req)
-		return
-	}
+	start := time.Now()
 
 	if !p.checkAuth(wr, req) {
 		return
@@ -215,11 +187,13 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	}
 	req.Header.Set("X-Tonutils-Proxy", p.version)
 
+	network := "internet"
 	var c = http.DefaultClient
 	if isHostInSpecialZone(req.Host) {
+		network = "ion"
 		log.Debug().Str("method", req.Method).Str("url", req.URL.String()).Msg("over rldp")
 		// proxy requests to ton using special client
-		c = client
+		c = client.Load()
 	} else {
 		if p.blockHttp {
 			http.Error(wr, "HTTP Not allowed", http.StatusBadRequest)
@@ -232,12 +206,15 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	resp, err := c.Do(req)
 	if err != nil {
 		text := err.Error()
+		statusCode := http.StatusBadGateway
 		if strings.Contains(text, "context deadline exceeded") {
-			http.Error(wr, "TON Site "+req.URL.Host+" is not responding.", http.StatusBadGateway)
+			http.Error(wr, "TON Site "+req.URL.Host+" is not responding.", statusCode)
 		} else {
-			http.Error(wr, "RLDP Proxy Error:\n"+text, http.StatusBadGateway)
+			http.Error(wr, "RLDP Proxy Error:\n"+text, statusCode)
 		}
 		log.Warn().Str("err", text).Str("method", req.Method).Str("url", req.URL.String()).Msg("cannot open")
+		proxyRequestsTotal.WithLabelValues(req.Method, strconv.Itoa(statusCode), network).Inc()
+		proxyRequestDuration.WithLabelValues(req.Method, network).Observe(time.Since(start).Seconds())
 		return
 	}
 	defer resp.Body.Close()
@@ -249,6 +226,9 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
 	io.Copy(wr, resp.Body)
+
+	proxyRequestsTotal.WithLabelValues(req.Method, strconv.Itoa(resp.StatusCode), network).Inc()
+	proxyRequestDuration.WithLabelValues(req.Method, network).Observe(time.Since(start).Seconds())
 }
 
 type State struct {
@@ -259,6 +239,12 @@ type State struct {
 
 var AuthUser string
 var AuthPass string
+
+// GetTransport returns the proxy transport, or nil if not yet initialized.
+func GetTransport() *transport.Transport { return proxyTransport.Load() }
+
+// IsReady returns true when the proxy transport has been fully initialized.
+func IsReady() bool { return proxyTransport.Load() != nil }
 
 func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
 	const configDefaultURL = `https://cdn.ice.io/mainnet/global.config.json`
@@ -535,13 +521,13 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	})
 
 	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
-	proxyTransport = t
-	client = &http.Client{
+	proxyTransport.Store(t)
+	client.Store(&http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	}
+	})
 	defer t.Stop()
 
 	log.Info().Str("address", addr).Msg("Starting proxy server")
@@ -613,24 +599,18 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 	api := ton.NewAPIClient(pool)
 
 	var root *address.Address
-	if true {
-		// Use it temporarily while we wait for config #4 fix.
-		log.Warn().Msg("Using hardcoded root dns address for ION network")
-		root = address.MustParseAddr("Ef_f_EXeJkjJIKwCPP9kGVrp-R1Pkf1jxowkvvxsB7TFG3uS")
-	} else {
-		for attempt := range 5 { // retry to not get liteserver not found block err
-			// get root dns address from network config
-			log.Debug().Int("attempt", attempt+1).Msg("fetching root dns address from network config")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			root, err = dns.GetRootContractAddr(ctx, api)
-			cancel()
-			if err != nil {
-				time.Sleep(500 * time.Millisecond)
-				log.Error().Err(err).Msg("failed to get root dns address, retrying...")
-				continue
-			}
-			break
+	for attempt := range 5 { // retry to not get liteserver not found block err
+		// get root dns address from network config
+		log.Debug().Int("attempt", attempt+1).Msg("fetching root dns address from network config")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		root, err = dns.GetRootContractAddr(ctx, api)
+		cancel()
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			log.Error().Err(err).Msg("failed to get root dns address, retrying...")
+			continue
 		}
+		break
 	}
 	if err != nil {
 		return nil, nil, err
