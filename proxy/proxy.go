@@ -613,24 +613,18 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 	api := ton.NewAPIClient(pool)
 
 	var root *address.Address
-	if true {
-		// Use it temporarily while we wait for config #4 fix.
-		log.Warn().Msg("Using hardcoded root dns address for ION network")
-		root = address.MustParseAddr("Ef_f_EXeJkjJIKwCPP9kGVrp-R1Pkf1jxowkvvxsB7TFG3uS")
-	} else {
-		for attempt := range 5 { // retry to not get liteserver not found block err
-			// get root dns address from network config
-			log.Debug().Int("attempt", attempt+1).Msg("fetching root dns address from network config")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			root, err = dns.GetRootContractAddr(ctx, api)
-			cancel()
-			if err != nil {
-				time.Sleep(500 * time.Millisecond)
-				log.Error().Err(err).Msg("failed to get root dns address, retrying...")
-				continue
-			}
-			break
+	for attempt := range 5 { // retry to not get liteserver not found block err
+		// get root dns address from network config
+		log.Debug().Int("attempt", attempt+1).Msg("fetching root dns address from network config")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		root, err = dns.GetRootContractAddr(ctx, api)
+		cancel()
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			log.Error().Err(err).Msg("failed to get root dns address, retrying...")
+			continue
 		}
+		break
 	}
 	if err != nil {
 		return nil, nil, err
