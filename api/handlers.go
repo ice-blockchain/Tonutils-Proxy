@@ -1,11 +1,16 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
+	"github.com/xssnick/tonutils-go/ton/dns"
 )
 
 func (s *Server) handleResolve(c *gin.Context) {
@@ -21,10 +26,17 @@ func (s *Server) handleResolve(c *gin.Context) {
 		return
 	}
 
-	result, err := t.ResolveDomain(c.Request.Context(), domain)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	result, err := t.ResolveDomain(ctx, domain)
 	if err != nil {
 		log.Error().Err(err).Str("domain", domain).Msg("resolve failed")
-		c.JSON(http.StatusBadGateway, gin.H{"error": "resolve failed"})
+		if errors.Is(err, dns.ErrNoSuchRecord) || strings.Contains(err.Error(), "no site record") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+		} else {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "resolve failed"})
+		}
 		return
 	}
 

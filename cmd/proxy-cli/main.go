@@ -56,7 +56,7 @@ func newFileConfig() (*config.Config, error) {
 	return config.LoadConfig("./")
 }
 
-func newAPIServer(cliCfg CLIConfig) *api.Server {
+func newAPIServer(cliCfg CLIConfig) (*api.Server, error) {
 	return api.New(
 		api.Config{
 			Addr:     cliCfg.APIAddr,
@@ -86,7 +86,7 @@ func registerAPILifecycle(lc fx.Lifecycle, srv *api.Server) {
 	})
 }
 
-func registerProxyLifecycle(lc fx.Lifecycle, cliCfg CLIConfig, fileCfg *config.Config) {
+func registerProxyLifecycle(lc fx.Lifecycle, shutdowner fx.Shutdowner, cliCfg CLIConfig, fileCfg *config.Config) {
 	proxy.AuthUser = cliCfg.AuthUser
 	proxy.AuthPass = cliCfg.AuthPass
 
@@ -121,7 +121,8 @@ func registerProxyLifecycle(lc fx.Lifecycle, cliCfg CLIConfig, fileCfg *config.C
 			go func() {
 				err := proxy.RunProxy(closerCtx, cliCfg.Addr, fileCfg.ADNLKey, nil, "CLI "+GitCommit, cliCfg.BlockHttp, cliCfg.NetworkConfigPath, fileCfg.TunnelConfig, customTunNetCfg)
 				if err != nil {
-					log.Fatal().Err(err).Msg("proxy failed")
+					log.Error().Err(err).Msg("proxy failed")
+					_ = shutdowner.Shutdown(fx.ExitCode(1))
 				}
 			}()
 			return nil
@@ -139,6 +140,10 @@ func registerProxyLifecycle(lc fx.Lifecycle, cliCfg CLIConfig, fileCfg *config.C
 
 func main() {
 	cliCfg := parseCLIConfig()
+
+	if (cliCfg.AuthUser == "") != (cliCfg.AuthPass == "") {
+		log.Fatal().Msg("both --auth-user and --auth-pass must be provided together")
+	}
 
 	log.Info().Msg("Version:" + GitCommit)
 	if cliCfg.BlockHttp {

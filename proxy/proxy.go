@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -79,8 +80,8 @@ type proxy struct {
 	authPass  string
 }
 
-var client *http.Client
-var proxyTransport *transport.Transport
+var client atomic.Pointer[http.Client]
+var proxyTransport atomic.Pointer[transport.Transport]
 
 var (
 	proxyRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -192,7 +193,7 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		network = "ion"
 		log.Debug().Str("method", req.Method).Str("url", req.URL.String()).Msg("over rldp")
 		// proxy requests to ton using special client
-		c = client
+		c = client.Load()
 	} else {
 		if p.blockHttp {
 			http.Error(wr, "HTTP Not allowed", http.StatusBadRequest)
@@ -240,10 +241,10 @@ var AuthUser string
 var AuthPass string
 
 // GetTransport returns the proxy transport, or nil if not yet initialized.
-func GetTransport() *transport.Transport { return proxyTransport }
+func GetTransport() *transport.Transport { return proxyTransport.Load() }
 
 // IsReady returns true when the proxy transport has been fully initialized.
-func IsReady() bool { return proxyTransport != nil }
+func IsReady() bool { return proxyTransport.Load() != nil }
 
 func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
 	const configDefaultURL = `https://cdn.ice.io/mainnet/global.config.json`
@@ -520,13 +521,13 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	})
 
 	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
-	proxyTransport = t
-	client = &http.Client{
+	proxyTransport.Store(t)
+	client.Store(&http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	}
+	})
 	defer t.Stop()
 
 	log.Info().Str("address", addr).Msg("Starting proxy server")

@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/xssnick/tonutils-proxy/proxy/transport"
@@ -22,19 +24,26 @@ type State struct {
 type Server struct {
 	engine     *gin.Engine
 	httpServer *http.Server
+	listener   net.Listener
 	config     Config
 	state      State
 }
 
-func New(cfg Config, state State) *Server {
+func New(cfg Config, state State) (*Server, error) {
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
+
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
 	s := &Server{
-		engine: engine,
-		config: cfg,
-		state:  state,
+		engine:   engine,
+		listener: ln,
+		config:   cfg,
+		state:    state,
 	}
 
 	// Public endpoints (no auth)
@@ -49,15 +58,18 @@ func New(cfg Config, state State) *Server {
 	resolve.GET("/:domain", s.handleResolve)
 
 	s.httpServer = &http.Server{
-		Addr:    cfg.Addr,
-		Handler: engine,
+		Handler:           engine,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
-	return s
+	return s, nil
 }
 
 func (s *Server) Start() error {
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := s.httpServer.Serve(s.listener); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
