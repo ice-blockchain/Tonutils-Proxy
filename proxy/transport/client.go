@@ -154,10 +154,18 @@ func (t *Transport) Stop() {
 }
 
 func (t *Transport) EnableCache() {
+	if t.cache != nil {
+		return
+	}
 	t.cache = ttlcache.New[string, *cacheEntry](
 		ttlcache.WithTTL[string, *cacheEntry](dnsCacheTTL),
 	)
 	go t.cache.Start()
+}
+
+func normalizeHost(host string) string {
+	host = strings.ToLower(host)
+	return strings.TrimSuffix(host, ".")
 }
 
 func isDNSCacheable(host string) bool {
@@ -165,7 +173,7 @@ func isDNSCacheable(host string) bool {
 	if idx == -1 {
 		return false
 	}
-	zone := strings.ToLower(host[idx:])
+	zone := host[idx:]
 	return zone == ".ton" || zone == ".ion"
 }
 
@@ -758,6 +766,7 @@ func (t *Transport) resolveHost(ctx context.Context, host string) (id []byte, in
 	if targetHost, _, splitErr := net.SplitHostPort(host); targetHost != "" && splitErr == nil {
 		host = targetHost
 	}
+	host = normalizeHost(host)
 
 	start := time.Now()
 	defer func() {
