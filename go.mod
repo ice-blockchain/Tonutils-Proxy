@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/gin-gonic/gin v1.12.0
+	github.com/jellydator/ttlcache/v3 v3.4.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.0
 	github.com/sigurn/crc16 v0.0.0-20240131213347-83fcde1e29d1

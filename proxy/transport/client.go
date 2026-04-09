@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
@@ -43,6 +44,21 @@ var (
 
 const _ChunkSize = 1 << 17
 const _RLDPMaxAnswerSize = 2*_ChunkSize + 1024
+
+const (
+	dnsCacheTTL = 3 * time.Minute
+	dhtCacheTTL = 1 * time.Minute
+)
+
+type cacheEntry struct {
+	// DNS fields (used for "dns:" keys)
+	id        []byte
+	inStorage bool
+
+	// DHT fields (used for "dht:" keys)
+	addresses *address.List
+	pubKey    ed25519.PublicKey
+}
 
 type DHT interface {
 	StoreAddress(ctx context.Context, addresses address.List, ttl time.Duration, ownerKey ed25519.PrivateKey, copies int) (int, []byte, error)
@@ -107,6 +123,7 @@ type Transport struct {
 	gate             *adnl.Gateway
 
 	activeSites map[string]*siteInfo
+	cache       *ttlcache.Cache[string, *cacheEntry]
 
 	activeRequests map[string]*payloadStream
 	globalCtx      context.Context
@@ -130,7 +147,46 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, storeConn stor
 }
 
 func (t *Transport) Stop() {
+	if t.cache != nil {
+		t.cache.Stop()
+	}
 	t.stop()
+}
+
+func (t *Transport) EnableCache() {
+	t.cache = ttlcache.New[string, *cacheEntry](
+		ttlcache.WithTTL[string, *cacheEntry](dnsCacheTTL),
+	)
+	go t.cache.Start()
+}
+
+func isDNSCacheable(host string) bool {
+	idx := strings.LastIndex(host, ".")
+	if idx == -1 {
+		return false
+	}
+	zone := strings.ToLower(host[idx:])
+	return zone == ".ton" || zone == ".ion"
+}
+
+func (t *Transport) findAddressesCached(ctx context.Context, id []byte) (*address.List, ed25519.PublicKey, error) {
+	key := "dht:" + hex.EncodeToString(id)
+	if t.cache != nil {
+		if item := t.cache.Get(key); item != nil {
+			entry := item.Value()
+			return entry.addresses, entry.pubKey, nil
+		}
+	}
+
+	addresses, pubKey, err := t.dht.FindAddresses(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if t.cache != nil {
+		t.cache.Set(key, &cacheEntry{addresses: addresses, pubKey: pubKey}, dhtCacheTTL)
+	}
+	return addresses, pubKey, nil
 }
 
 func (t *Transport) cleaner() {
@@ -675,6 +731,7 @@ type ResolveResult struct {
 	BagID    string `json:"bag_id,omitempty"`
 	IP       string `json:"ip,omitempty"`
 	Port     int    `json:"port,omitempty"`
+	Cached   bool   `json:"cached"`
 }
 
 func (t *Transport) fillDHTAddress(ctx context.Context, result *ResolveResult) {
@@ -683,7 +740,7 @@ func (t *Transport) fillDHTAddress(ctx context.Context, result *ResolveResult) {
 		return
 	}
 
-	addresses, _, err := t.dht.FindAddresses(ctx, id)
+	addresses, _, err := t.findAddressesCached(ctx, id)
 	if err != nil {
 		log.Debug().Err(err).Str("adnl", result.ADNLAddr).Msg("DHT lookup failed")
 		return
@@ -697,7 +754,7 @@ func (t *Transport) fillDHTAddress(ctx context.Context, result *ResolveResult) {
 
 // resolveHost resolves a hostname to a raw ID and storage flag.
 // Handles .adnl, .bag suffixes and parallel TON DNS lookup.
-func (t *Transport) resolveHost(ctx context.Context, host string) (id []byte, inStorage bool, err error) {
+func (t *Transport) resolveHost(ctx context.Context, host string) (id []byte, inStorage bool, cached bool, err error) {
 	if targetHost, _, splitErr := net.SplitHostPort(host); targetHost != "" && splitErr == nil {
 		host = targetHost
 	}
@@ -719,17 +776,24 @@ func (t *Transport) resolveHost(ctx context.Context, host string) (id []byte, in
 	if strings.HasSuffix(host, ".adnl") {
 		id, err = ParseADNLAddress(host[:len(host)-5])
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to parse adnl address %s: %w", host, err)
+			return nil, false, false, fmt.Errorf("failed to parse adnl address %s: %w", host, err)
 		}
-		return id, false, nil
+		return id, false, false, nil
 	}
 
 	if strings.HasSuffix(host, ".bag") {
 		id, err = hex.DecodeString(host[:len(host)-4])
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to parse bag id %s: %w", host, err)
+			return nil, false, false, fmt.Errorf("failed to parse bag id %s: %w", host, err)
 		}
-		return id, true, nil
+		return id, true, false, nil
+	}
+
+	if t.cache != nil && isDNSCacheable(host) {
+		if item := t.cache.Get("dns:" + host); item != nil {
+			entry := item.Value()
+			return entry.id, entry.inStorage, true, nil
+		}
 	}
 
 	lookupCtx, stopLookup := context.WithCancel(ctx)
@@ -778,16 +842,19 @@ func (t *Transport) resolveHost(ctx context.Context, host string) (id []byte, in
 	case domain := <-ch:
 		stopLookup()
 		if domain == nil {
-			return nil, false, fmt.Errorf("domain %s: %w", host, dns.ErrNoSuchRecord)
+			return nil, false, false, fmt.Errorf("domain %s: %w", host, dns.ErrNoSuchRecord)
 		}
 		id, inStorage = domain.GetSiteRecord()
 		if id == nil {
-			return nil, false, fmt.Errorf("domain %s: no site record found in DNS", host)
+			return nil, false, false, fmt.Errorf("domain %s: no site record found in DNS", host)
+		}
+		if t.cache != nil && isDNSCacheable(host) {
+			t.cache.Set("dns:"+host, &cacheEntry{id: id, inStorage: inStorage}, dnsCacheTTL)
 		}
 		log.Info().Str("domain", host).Dur("duration", time.Since(start)).Msg("resolve domain took")
-		return id, inStorage, nil
+		return id, inStorage, false, nil
 	case <-ctx.Done():
-		return nil, false, fmt.Errorf("failed to resolve domain %s", host)
+		return nil, false, false, fmt.Errorf("failed to resolve domain %s", host)
 	}
 }
 
@@ -797,12 +864,12 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 		host = targetHost
 	}
 
-	id, inStorage, err := t.resolveHost(ctx, host)
+	id, inStorage, cached, err := t.resolveHost(ctx, host)
 	if err != nil {
 		return nil, err
 	}
 
-	result := &ResolveResult{Domain: host}
+	result := &ResolveResult{Domain: host, Cached: cached}
 	if inStorage {
 		result.Type = "storage"
 		result.BagID = hex.EncodeToString(id)
@@ -816,7 +883,7 @@ func (t *Transport) ResolveDomain(ctx context.Context, host string) (*ResolveRes
 
 // resolve resolves a domain and establishes a connection (for the proxy).
 func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error) {
-	id, inStorage, err := t.resolveHost(ctx, host)
+	id, inStorage, _, err := t.resolveHost(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -848,7 +915,7 @@ func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error)
 
 	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("resolving ton site address")
 
-	addresses, pubKey, err := t.dht.FindAddresses(ctx, id)
+	addresses, pubKey, err := t.findAddressesCached(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT, err: %w", host, hex.EncodeToString(id), err)
 	}

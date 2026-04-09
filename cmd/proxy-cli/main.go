@@ -87,9 +87,6 @@ func registerAPILifecycle(lc fx.Lifecycle, srv *api.Server) {
 }
 
 func registerProxyLifecycle(lc fx.Lifecycle, shutdowner fx.Shutdowner, cliCfg CLIConfig, fileCfg *config.Config) {
-	proxy.AuthUser = cliCfg.AuthUser
-	proxy.AuthPass = cliCfg.AuthPass
-
 	var customTunNetCfg *liteclient.GlobalConfig
 	if fileCfg.CustomTunnelNetworkConfigPath != "" {
 		var err error
@@ -119,7 +116,13 @@ func registerProxyLifecycle(lc fx.Lifecycle, shutdowner fx.Shutdowner, cliCfg CL
 		OnStart: func(context.Context) error {
 			closerCtx, stop = context.WithCancel(context.Background())
 			go func() {
-				err := proxy.RunProxy(closerCtx, cliCfg.Addr, fileCfg.ADNLKey, nil, "CLI "+GitCommit, cliCfg.BlockHttp, cliCfg.NetworkConfigPath, fileCfg.TunnelConfig, customTunNetCfg)
+				opts := []proxy.Option{proxy.WithCache()}
+				if cliCfg.AuthUser != "" {
+					opts = append(opts, proxy.WithAuth(cliCfg.AuthUser, cliCfg.AuthPass))
+				}
+				err := proxy.RunProxy(closerCtx, cliCfg.Addr, fileCfg.ADNLKey, nil, "CLI "+GitCommit, cliCfg.BlockHttp, cliCfg.NetworkConfigPath, fileCfg.TunnelConfig, customTunNetCfg,
+					opts...,
+				)
 				if err != nil {
 					log.Error().Err(err).Msg("proxy failed")
 					_ = shutdowner.Shutdown(fx.ExitCode(1))
