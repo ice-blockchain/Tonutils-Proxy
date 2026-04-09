@@ -40,7 +40,7 @@ func (s *Server) handleResolve(c *gin.Context) {
 		return
 	}
 
-	log.Debug().Str("domain", domain).Str("type", result.Type).Str("adnl_address", result.ADNLAddr).Str("bag_id", result.BagID).Str("ip", result.IP).Int("port", result.Port).Msg("resolve success")
+	log.Debug().Str("domain", domain).Str("type", result.Type).Str("adnl_address", result.ADNLAddr).Str("bag_id", result.BagID).Str("ip", result.IP).Int("port", result.Port).Bool("cached", result.Cached).Msg("resolve success")
 
 	c.JSON(http.StatusOK, result)
 }

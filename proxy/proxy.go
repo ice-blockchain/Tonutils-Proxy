@@ -237,8 +237,26 @@ type State struct {
 	Stopped bool
 }
 
-var AuthUser string
-var AuthPass string
+type proxyConfig struct {
+	authUser    string
+	authPass    string
+	enableCache bool
+}
+
+type Option func(*proxyConfig)
+
+func WithAuth(user, pass string) Option {
+	return func(c *proxyConfig) {
+		c.authUser = user
+		c.authPass = pass
+	}
+}
+
+func WithCache() Option {
+	return func(c *proxyConfig) {
+		c.enableCache = true
+	}
+}
 
 // GetTransport returns the proxy transport, or nil if not yet initialized.
 func GetTransport() *transport.Transport { return proxyTransport.Load() }
@@ -246,7 +264,7 @@ func GetTransport() *transport.Transport { return proxyTransport.Load() }
 // IsReady returns true when the proxy transport has been fully initialized.
 func IsReady() bool { return proxyTransport.Load() != nil }
 
-func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
+func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, versionAndDevice string, blockHttp bool, netConfigPath string, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, opts ...Option) error {
 	const configDefaultURL = `https://cdn.ice.io/mainnet/global.config.json`
 
 	if res != nil {
@@ -281,7 +299,7 @@ func RunProxy(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey
 		}
 	}
 
-	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg)
+	return RunProxyWithConfig(closerCtx, addr, adnlKey, res, blockHttp, versionAndDevice, lsCfg, tunCfg, customTunNetCfg, opts...)
 }
 
 var OnTunnel = func(addr string) {}
@@ -294,7 +312,12 @@ var OnAskReroute = func() bool { return false }
 
 var OnTunnelStopped = func() {}
 
-func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig) error {
+func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.PrivateKey, res chan<- State, blockHttp bool, versionAndDevice string, lsCfg *liteclient.GlobalConfig, tunCfg *tunnelConfig.ClientConfig, customTunNetCfg *liteclient.GlobalConfig, opts ...Option) error {
+	cfg := &proxyConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
 	report := func(s State) {
 		if res != nil {
 			res <- s
@@ -521,6 +544,9 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	})
 
 	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
+	if cfg.enableCache {
+		t.EnableCache()
+	}
 	proxyTransport.Store(t)
 	client.Store(&http.Client{
 		Transport: t,
@@ -535,8 +561,8 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	server := http.Server{Addr: addr, Handler: &proxy{
 		blockHttp: blockHttp,
 		version:   versionAndDevice,
-		authUser:  AuthUser,
-		authPass:  AuthPass,
+		authUser:  cfg.authUser,
+		authPass:  cfg.authPass,
 	}}
 
 	go func() {

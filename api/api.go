@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-proxy/proxy/transport"
 )
 
@@ -34,6 +35,7 @@ func New(cfg Config, state State) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Info().Str("addr", cfg.Addr).Msg("API server listening on")
 
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
